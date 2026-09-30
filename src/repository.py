@@ -10,6 +10,10 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _decode_json(value):
+    return json.loads(value)
+
+
 class Repository:
     def __init__(self, path):
         self.path = path
@@ -62,6 +66,7 @@ class Repository:
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     item_id INTEGER,
+                    batch_no TEXT,
                     event_type TEXT NOT NULL,
                     actor TEXT,
                     role TEXT,
@@ -70,6 +75,48 @@ class Repository:
                     event_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS batches (
+                    batch_no TEXT PRIMARY KEY,
+                    station_id TEXT NOT NULL,
+                    frequency_mhz REAL NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    version INTEGER NOT NULL DEFAULT 1,
+                    payload TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(station_id, frequency_mhz, observed_at)
+                );
+                CREATE TABLE IF NOT EXISTS batch_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    batch_no TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    payload TEXT NOT NULL,
+                    actor TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(batch_no, version)
+                );
+                CREATE TABLE IF NOT EXISTS item_links (
+                    item_id INTEGER PRIMARY KEY,
+                    batch_no TEXT NOT NULL,
+                    FOREIGN KEY(item_id) REFERENCES items(id)
+                );
+                CREATE TABLE IF NOT EXISTS merge_sessions (
+                    token TEXT PRIMARY KEY,
+                    batch_no TEXT NOT NULL,
+                    base_version INTEGER NOT NULL,
+                    current_version INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    conflicts TEXT NOT NULL,
+                    incoming_payload TEXT NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_item_links_batch ON item_links(batch_no);
+                CREATE INDEX IF NOT EXISTS idx_audit_batch ON audit_events(batch_no);
                 """
             )
         finally:
@@ -82,17 +129,31 @@ class Repository:
         result["payload"] = json.loads(result["payload"])
         return result
 
-    def _last_hash(self, conn, item_id):
-        row = conn.execute(
-            "SELECT event_hash FROM audit_events WHERE item_id IS ? ORDER BY id DESC LIMIT 1",
-            (item_id,),
-        ).fetchone()
+    def _last_hash(self, conn, item_id=None, batch_no=None):
+        if batch_no is not None:
+            row = conn.execute(
+                "SELECT event_hash FROM audit_events WHERE batch_no=? ORDER BY id DESC LIMIT 1",
+                (batch_no,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT event_hash FROM audit_events WHERE item_id IS ? ORDER BY id DESC LIMIT 1",
+                (item_id,),
+            ).fetchone()
         return row["event_hash"] if row else "GENESIS"
 
     def append_audit(self, conn, item_id, event_type, actor, role, payload):
-        previous = self._last_hash(conn, item_id)
+        previous = self._last_hash(conn, item_id=item_id)
+        self._insert_audit(conn, item_id, None, event_type, actor, role, payload, previous)
+
+    def append_batch_audit(self, conn, batch_no, event_type, actor, role, payload):
+        previous = self._last_hash(conn, batch_no=batch_no)
+        self._insert_audit(conn, None, batch_no, event_type, actor, role, payload, previous)
+
+    def _insert_audit(self, conn, item_id, batch_no, event_type, actor, role, payload, previous):
         event = {
             "item_id": item_id,
+            "batch_no": batch_no,
             "event_type": event_type,
             "actor": actor,
             "role": role,
@@ -101,10 +162,39 @@ class Repository:
         }
         event_hash = audit_hash(previous, event)
         conn.execute(
-            "INSERT INTO audit_events(item_id,event_type,actor,role,payload,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (item_id, event_type, actor, role, canonical_json(payload), previous, event_hash, event["created_at"]),
+            "INSERT INTO audit_events(item_id,batch_no,event_type,actor,role,payload,previous_hash,event_hash,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                item_id,
+                batch_no,
+                event_type,
+                actor,
+                role,
+                canonical_json(payload),
+                previous,
+                event_hash,
+                event["created_at"],
+            ),
         )
 
+    def append_denied_audit(self, item_id, event_type, actor, role, payload):
+        """越权/越区尝试仅追加审计，不改变原记录。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self.append_audit(conn, item_id, event_type, actor, role, payload)
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Items
+    # ------------------------------------------------------------------
     def create_item(self, entity_type, stable_key, initial_status, payload, actor, role):
         conn = self.connect()
         try:
@@ -127,6 +217,12 @@ class Repository:
             except sqlite3.IntegrityError:
                 raise ConflictError("duplicate_item", "同一业务实体已经存在")
             item_id = conn.execute("SELECT last_insert_rowid() AS id").fetchone()["id"]
+            batch_no = payload.get("batch_no")
+            if batch_no:
+                conn.execute(
+                    "INSERT INTO item_links(item_id,batch_no) VALUES(?,?)",
+                    (item_id, batch_no),
+                )
             self.append_audit(conn, item_id, "created", actor, role, {"stable_key": stable_key})
             conn.execute("COMMIT")
             return self.get_item(item_id)
@@ -237,6 +333,34 @@ class Repository:
         finally:
             conn.close()
 
+    def append_item_proposal(self, item_id, actor, role, new_payload, proposal):
+        """原辖区处置意见：不检查/不递增版本号，仅追加，避免并发互相覆盖。"""
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+            if row is None:
+                raise NotFoundError("item_not_found", "业务实体不存在")
+            conn.execute(
+                "UPDATE items SET payload=?,updated_at=? WHERE id=?",
+                (canonical_json(new_payload), now_iso(), item_id),
+            )
+            conn.execute(
+                "INSERT INTO actions(item_id,action,actor,role,payload,created_at) VALUES(?,?,?,?,?,?)",
+                (item_id, "propose", actor, role, canonical_json({"proposal": proposal}), now_iso()),
+            )
+            self.append_audit(conn, item_id, "propose", actor, role, {"proposal": proposal})
+            conn.execute("COMMIT")
+            return self.get_item(item_id)
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def audit_trail(self, item_id):
         conn = self.connect()
         try:
@@ -257,5 +381,347 @@ class Repository:
             for row in conn.execute("SELECT status, COUNT(*) AS total FROM items GROUP BY status").fetchall():
                 counts[row["status"]] = row["total"]
             return {"counts": counts, "items": self.list_items()}
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    # Measurement batches
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _row_to_batch(row):
+        if row is None:
+            return None
+        result = dict(row)
+        result["payload"] = json.loads(result["payload"])
+        return result
+
+    def _next_batch_no(self, conn):
+        for _ in range(5):
+            candidate = "MB-%08d" % (conn.execute("SELECT COUNT(*) AS total FROM batches").fetchone()["total"] + 1)
+            if conn.execute("SELECT 1 FROM batches WHERE batch_no=?", (candidate,)).fetchone() is None:
+                return candidate
+        raise DomainError("batch_no_unavailable", "批次号分配失败，请重试", 503)
+
+    def submit_report(self, report, actor, role, invalidate_plan):
+        """监测站上报写入。
+
+        - 显式 batch_no 命中已有批次：原样返回（写入失败后的幂等重试）；
+        - 自然键（站点/频点/观测时刻）命中：归并 reporter 维度不同的上报；
+        - 否则新建批次。
+        invalidate_plan(batch_payload, version) 在批次更新的同一事务内失效关联案件。
+        返回 (batch, outcome)，outcome 为 created/merged/retried/duplicate。
+        """
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            requested_no = report["batch_no"]
+            if requested_no is not None:
+                row = conn.execute("SELECT * FROM batches WHERE batch_no=?", (requested_no,)).fetchone()
+                if row is not None:
+                    conn.execute("COMMIT")
+                    return self._row_to_batch(row), "retried"
+
+            identity = (report["station_id"], report["frequency_mhz"], report["observed_at"])
+            row = conn.execute(
+                "SELECT * FROM batches WHERE station_id=? AND frequency_mhz=? AND observed_at=?",
+                identity,
+            ).fetchone()
+            if row is not None:
+                batch = self._row_to_batch(row)
+                reports = batch["payload"].setdefault("reports", [])
+                signature = (report["reporter"], report["strength_dbm"], report.get("note", ""))
+                existing = {
+                    (r["reporter"], r["strength_dbm"], r.get("note", ""))
+                    for r in reports
+                }
+                if signature in existing:
+                    # 完全相同的重复上报：幂等返回，不升版本，不触发失效
+                    conn.execute("COMMIT")
+                    batch_no = batch["batch_no"]
+                    return self.get_batch(batch_no), "duplicate"
+                reports.append(
+                    {
+                        "reporter": report["reporter"],
+                        "strength_dbm": report["strength_dbm"],
+                        "note": report.get("note", ""),
+                        "submitted_at": now_iso(),
+                    }
+                )
+                version = int(batch["version"]) + 1
+                batch["payload"]["version"] = version
+                conn.execute(
+                    "UPDATE batches SET version=?,payload=?,updated_at=? WHERE batch_no=?",
+                    (version, canonical_json(batch["payload"]), now_iso(), batch["batch_no"]),
+                )
+                self._record_revision(conn, batch, actor, role)
+                event = {"reason": "duplicate_report_merged", "reporter": report["reporter"]}
+                self.append_batch_audit(conn, batch["batch_no"], "report_merged", actor, role, event)
+                invalidate_plan(conn, batch["payload"], version)
+                conn.execute("COMMIT")
+                return self.get_batch(batch["batch_no"]), "merged"
+
+            batch_no = requested_no or self._next_batch_no(conn)
+            stamp = now_iso()
+            payload = {
+                "batch_no": batch_no,
+                "station_id": report["station_id"],
+                "frequency_mhz": report["frequency_mhz"],
+                "observed_at": report["observed_at"],
+                "strength_dbm": report["strength_dbm"],
+                "bandwidth_mhz": report["bandwidth_mhz"],
+                "region": report["region"],
+                "note": report["note"],
+                "reports": [
+                    {
+                        "reporter": report["reporter"],
+                        "strength_dbm": report["strength_dbm"],
+                        "note": report.get("note", ""),
+                        "submitted_at": stamp,
+                    }
+                ],
+                "version": 1,
+            }
+            try:
+                conn.execute(
+                    "INSERT INTO batches(batch_no,station_id,frequency_mhz,observed_at,version,payload,created_by,created_role,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        batch_no,
+                        report["station_id"],
+                        report["frequency_mhz"],
+                        report["observed_at"],
+                        1,
+                        canonical_json(payload),
+                        actor,
+                        role,
+                        stamp,
+                        stamp,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                raise ConflictError("batch_no_taken", "批次号已被占用")
+            self._record_revision(conn, {"batch_no": batch_no, "payload": payload, "version": 1}, actor, role)
+            self.append_batch_audit(
+                conn,
+                batch_no,
+                "batch_created",
+                actor,
+                role,
+                {"station_id": report["station_id"], "frequency_mhz": report["frequency_mhz"], "observed_at": report["observed_at"]},
+            )
+            conn.execute("COMMIT")
+            return self.get_batch(batch_no), "created"
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _record_revision(conn, batch, actor, role):
+        conn.execute(
+            "INSERT INTO batch_revisions(batch_no,version,payload,actor,role,created_at) VALUES(?,?,?,?,?,?)",
+            (
+                batch["batch_no"],
+                int(batch["payload"]["version"]),
+                canonical_json(batch["payload"]),
+                actor,
+                role,
+                now_iso(),
+            ),
+        )
+
+    def get_batch(self, batch_no):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT * FROM batches WHERE batch_no=?", (batch_no,)).fetchone()
+            if row is None:
+                raise NotFoundError("batch_not_found", "测量批次不存在")
+            return self._row_to_batch(row)
+        finally:
+            conn.close()
+
+    def get_batch_payload_at(self, conn, batch_no, version):
+        row = conn.execute(
+            "SELECT payload FROM batch_revisions WHERE batch_no=? AND version=?",
+            (batch_no, version),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row["payload"])
+
+    def list_batches(self):
+        conn = self.connect()
+        try:
+            rows = conn.execute("SELECT * FROM batches ORDER BY created_at DESC").fetchall()
+            return [self._row_to_batch(row) for row in rows]
+        finally:
+            conn.close()
+
+    def commit_batch_edit(self, batch_no, base_version, merged_payload, actor, role, invalidate_plan):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM batches WHERE batch_no=?", (batch_no,)).fetchone()
+            if row is None:
+                raise NotFoundError("batch_not_found", "测量批次不存在")
+            current = self._row_to_batch(row)
+            base = self.get_batch_payload_at(conn, batch_no, base_version)
+            if base is None:
+                raise DomainError("unknown_base_version", "基准版本不存在，请重新读取", 409)
+            version = int(current["version"]) + 1
+            merged_payload["version"] = version
+            conn.execute(
+                "UPDATE batches SET version=?,payload=?,updated_at=? WHERE batch_no=?",
+                (version, canonical_json(merged_payload), now_iso(), batch_no),
+            )
+            self._record_revision(conn, {"batch_no": batch_no, "payload": merged_payload, "version": version}, actor, role)
+            self.append_batch_audit(
+                conn,
+                batch_no,
+                "batch_updated",
+                actor,
+                role,
+                {"base_version": base_version, "new_version": version},
+            )
+            affected = invalidate_plan(conn, merged_payload, version)
+            conn.execute("COMMIT")
+            return self.get_batch(batch_no), affected
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def items_for_batch(self, conn, batch_no):
+        rows = conn.execute(
+            "SELECT items.* FROM items JOIN item_links ON items.id = item_links.item_id WHERE item_links.batch_no=?",
+            (batch_no,),
+        ).fetchall()
+        return [Repository._static_row_to_item(row) for row in rows]
+
+    @staticmethod
+    def _static_row_to_item(row):
+        result = dict(row)
+        result["payload"] = json.loads(result["payload"])
+        return result
+
+    def save_merge_session(self, token, batch_no, base_version, current_version, conflicts, incoming_payload, actor):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "INSERT INTO merge_sessions(token,batch_no,base_version,current_version,status,conflicts,incoming_payload,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    token,
+                    batch_no,
+                    base_version,
+                    current_version,
+                    "open",
+                    canonical_json(conflicts),
+                    canonical_json(incoming_payload),
+                    actor,
+                    now_iso(),
+                ),
+            )
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def get_merge_session(self, token):
+        conn = self.connect()
+        try:
+            row = conn.execute("SELECT * FROM merge_sessions WHERE token=?", (token,)).fetchone()
+            if row is None:
+                raise NotFoundError("merge_session_not_found", "合并会话不存在或已失效")
+            result = dict(row)
+            result["conflicts"] = json.loads(result["conflicts"])
+            result["incoming_payload"] = json.loads(result["incoming_payload"])
+            return result
+        finally:
+            conn.close()
+
+    def resolve_merge_session(self, token, choices, actor, role, invalidate_plan):
+        conn = self.connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM merge_sessions WHERE token=?", (token,)).fetchone()
+            if row is None:
+                raise NotFoundError("merge_session_not_found", "合并会话不存在或已失效")
+            if row["status"] != "open":
+                raise ConflictError("merge_session_closed", "合并会话已处理")
+            session = dict(row)
+            conflicts = json.loads(session["conflicts"])
+            incoming = json.loads(session["incoming_payload"])
+            current_row = conn.execute("SELECT * FROM batches WHERE batch_no=?", (session["batch_no"],)).fetchone()
+            if current_row is None:
+                raise NotFoundError("batch_not_found", "测量批次不存在")
+            current = self._row_to_batch(current_row)
+
+            conflict_fields = {c["field"] for c in conflicts}
+            choice_fields = set(choices)
+            if choice_fields != conflict_fields:
+                raise DomainError("invalid_choices", "必须为每个冲突字段提供且仅提供一个选择（current 或 incoming）")
+            merged = dict(current["payload"])
+            for field in conflict_fields:
+                pick = choices[field]
+                if pick not in ("current", "incoming"):
+                    raise DomainError("invalid_choice", "%s 的选择必须是 current 或 incoming" % field)
+                source = current["payload"] if pick == "current" else incoming
+                merged[field] = source.get(field)
+            version = int(current["version"]) + 1
+            merged["version"] = version
+            conn.execute(
+                "UPDATE batches SET version=?,payload=?,updated_at=? WHERE batch_no=?",
+                (version, canonical_json(merged), now_iso(), session["batch_no"]),
+            )
+            self._record_revision(conn, {"batch_no": session["batch_no"], "payload": merged, "version": version}, actor, role)
+            conn.execute(
+                "UPDATE merge_sessions SET status='resolved', resolved_at=? WHERE token=?",
+                (now_iso(), token),
+            )
+            self.append_batch_audit(
+                conn,
+                session["batch_no"],
+                "merge_resolved",
+                actor,
+                role,
+                {"token": token, "choices": choices, "new_version": version},
+            )
+            affected = invalidate_plan(conn, merged, version)
+            conn.execute("COMMIT")
+            return self.get_batch(session["batch_no"]), affected
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def batch_audit_trail(self, batch_no):
+        conn = self.connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM audit_events WHERE batch_no=? ORDER BY id", (batch_no,)
+            ).fetchall()
+            result = []
+            for row in rows:
+                value = dict(row)
+                value["payload"] = json.loads(value["payload"])
+                result.append(value)
+            return result
         finally:
             conn.close()

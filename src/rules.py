@@ -11,12 +11,16 @@ ACTION_ROLES = {
     "locate": {"field_operator", "analyst"},
     "suspend": {"coordinator", "regulator"},
     "coordinate": {"coordinator"},
+    "propose": {"coordinator", "regulator"},
     "resolve": {"coordinator", "regulator"},
     "correct_measurement": {"analyst", "monitor"},
     "cancel": {"coordinator"},
 }
 ENFORCE_REGION = True
-REGION_SENSITIVE_ACTIONS = {"suspend", "coordinate", "resolve", "cancel"}
+# 停用/结案由目标辖区确认；处置意见由原辖区提交；协调在原辖区发起
+TARGET_REGION_ACTIONS = {"suspend", "resolve"}
+ORIGIN_REGION_ACTIONS = {"coordinate", "propose", "cancel"}
+REGION_SENSITIVE_ACTIONS = TARGET_REGION_ACTIONS | ORIGIN_REGION_ACTIONS
 ACTION_REQUIRES_VERSION = {"suspend", "coordinate", "resolve", "cancel"}
 
 
@@ -97,6 +101,17 @@ def apply_action(item, action, payload, actor, role):
         current["coordination_agreement"] = agreement
         current["coordination_note"] = payload.get("note", "")
         return "coordinating", current, {"coordination_agreement": agreement}
+
+    if action == "propose":
+        _need_status(item, {"assessed", "located", "suspended", "coordinating"})
+        opinion = _text(payload, "opinion")
+        proposal = {
+            "opinion": opinion,
+            "actor": actor,
+            "target_region": item["payload"].get("target_region"),
+        }
+        current.setdefault("disposition_proposals", []).append(proposal)
+        return status, current, {"proposal": proposal}
 
     if action == "resolve":
         _need_status(item, {"coordinating"})

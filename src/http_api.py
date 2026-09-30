@@ -41,7 +41,12 @@ def build_handler(service, static_dir):
         def _error(self, exc):
             status = getattr(exc, "status", 500)
             code = getattr(exc, "code", "internal_error")
-            self._send(status, {"error": code, "message": str(exc)})
+            body = {"error": code, "message": str(exc)}
+            for attr in ("merge_token", "batch_no", "conflicts", "candidate_version"):
+                value = getattr(exc, attr, None)
+                if value is not None:
+                    body[attr] = value
+            self._send(status, body)
 
         def do_GET(self):
             try:
@@ -52,12 +57,18 @@ def build_handler(service, static_dir):
                     return self._send(200, service.state())
                 if path == "/api/items":
                     return self._send(200, {"items": service.list_items()})
+                if path == "/api/batches":
+                    return self._send(200, {"batches": service.list_batches()})
                 parts = [part for part in path.split("/") if part]
                 if len(parts) == 3 and parts[:2] == ["api", "items"]:
                     return self._send(200, service.get_item(int(parts[2])))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "audit":
                     item = service.get_item(int(parts[2]))
                     return self._send(200, {"events": item["audit"]})
+                if len(parts) == 3 and parts[:2] == ["api", "batches"]:
+                    return self._send(200, service.get_batch(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "audit":
+                    return self._send(200, {"events": service.get_batch(parts[2])["audit"]})
                 if path == "/":
                     file_path = os.path.join(static_dir, "index.html")
                     with open(file_path, "rb") as handle:
@@ -76,6 +87,12 @@ def build_handler(service, static_dir):
                 path = urlparse(self.path).path
                 payload = self._json_body()
                 parts = [part for part in path.split("/") if part]
+                if parts == ["api", "batches", "reports"]:
+                    return self._send(201, service.submit_report(payload, actor, role))
+                if len(parts) == 4 and parts[:2] == ["api", "batches"] and parts[3] == "edits":
+                    return self._send(200, service.edit_batch(parts[2], payload, actor, role))
+                if len(parts) == 4 and parts[:2] == ["api", "merges"] and parts[3] == "resolve":
+                    return self._send(200, service.resolve_merge(parts[2], payload.get("choices", {}), actor, role))
                 if parts == ["api", "items"]:
                     return self._send(201, service.create_item(payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":

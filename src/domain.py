@@ -89,3 +89,34 @@ def normalize_source(payload):
         "station_id": payload.get("station_id"),
         "frequency_mhz": payload.get("frequency_mhz"),
     }
+
+
+def normalize_batch(payload):
+    """Normalize a monitoring-station report into a measurement batch.
+
+    Reports sharing the same station, frequency and observation moment are
+    merged into one batch; ``batch_number`` is an optional client-supplied
+    idempotency key used to retry a failed write without creating duplicates.
+    """
+    station_id = require_text(payload, "station_id")
+    frequency = number(payload, "frequency_mhz", 0.001, 300000)
+    observed_at = parse_timestamp(payload, "observed_at")
+    strength = number(payload, "strength_dbm")
+    bandwidth = payload.get("bandwidth_mhz")
+    if bandwidth is not None:
+        bandwidth = number(payload, "bandwidth_mhz", 0.001)
+    reporter = payload.get("reporter")
+    if reporter is not None:
+        reporter = str(reporter).strip() or None
+    batch_number = payload.get("batch_number")
+    if batch_number is not None:
+        batch_number = str(batch_number).strip() or None
+    return {
+        "station_id": station_id,
+        "frequency_mhz": frequency,
+        "observed_at": observed_at,
+        "strength_dbm": strength,
+        "bandwidth_mhz": bandwidth if bandwidth is not None else 0.1,
+        "reporter": reporter,
+        "batch_number": batch_number,
+    }

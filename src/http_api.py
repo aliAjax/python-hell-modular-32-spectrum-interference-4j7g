@@ -80,6 +80,12 @@ def build_handler(service, static_dir):
                     return self._send(201, service.create_item(payload, actor, role, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "sources":
                     return self._send(201, service.add_source(int(parts[2]), payload, actor, role, region))
+                if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "measurements":
+                    return self._send(201, service.submit_measurement(int(parts[2]), payload, actor, role, region))
+                if len(parts) == 6 and parts[:2] == ["api", "items"] and parts[3] == "batches" and parts[5] == "merge":
+                    expected = payload.pop("expected_version", None)
+                    base_payload = payload.pop("base_payload", None)
+                    return self._send(200, service.merge_batch(int(parts[2]), int(parts[4]), payload, actor, role, expected, base_payload, region))
                 if len(parts) == 4 and parts[:2] == ["api", "items"] and parts[3] == "actions":
                     action = payload.pop("action", "")
                     if not action:
